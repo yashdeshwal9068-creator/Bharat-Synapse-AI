@@ -1,0 +1,19 @@
+{
+  "name": "bharat-nova-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bharat Nova AI — 14-Engine Super AI chatbot with automatic high-intelligence failsafe fallback across 4 intelligence tiers (Gemini, OpenRouter, DeepSeek, Mistral, NVIDIA, Zai AI, Cloudflare, SiliconFlow, HuggingFace, Fireworks, Cohere, Groq, SambaNova, Cerebras), deployed on Vercel Edge Functions.",
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "build": "echo 'No build step — static frontend + Vercel Edge Function (api/server.js)'"
+  },
+  "notes": {
+    "dependencies": "Zero npm packages are required. All 14 AI provider API calls use the native fetch() and AbortController APIs built into the Vercel Edge Runtime (V8 isolate). Adding axios or the openai SDK would break the Edge Function — both depend on Node.js-specific modules (http, net, tls) that do not exist in the Edge Runtime.",
+    "runtime": "api/server.js runs as a Vercel Edge Function (export const config = { runtime: 'edge' }). The Edge Runtime has native fetch, Response, Request, AbortController, TextEncoder, and process.env — everything the 14-engine backend needs.",
+    "new_env_vars": "Add these in Vercel → Project → Settings → Environment Variables: DEEPSEEK_API_KEY, MISTRAL_API_KEY, ZAI_API_KEY, CLOUDFLARE_API_KEY, CLOUDFLARE_ACCOUNT_ID, SILICONFLOW_API_KEY, SAMBANOVA_API_KEY, CEREBRAS_API_KEY (plus the existing 7: GEMINI_API_KEY, GEMINI_API_KEY_2, OPENROUTER_API_KEY, NVIDIA_API_KEY, HUGGINGFACE_API_KEY, FIREWORKS_API_KEY, COHERE_API_KEY, GROQ_API_KEY)"
+  }
+}

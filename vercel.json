@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "buildCommand": "",
+  "outputDirectory": ".",
+
+  "functions": {
+    "api/server.js": {
+      "maxDuration": 30
+    }
+  },
+
+  "routes": [
+    { "src": "/api/server", "dest": "/api/server.js" },
+    { "handle": "filesystem" },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ]
+}
