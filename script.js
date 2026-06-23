@@ -9,19 +9,19 @@ const ENGINES = [
   { key:'openrouter',  name:'OpenRouter',  sub:'Claude / GPT free router',              color:'#8b5cf6' },
   { key:'deepseek',    name:'DeepSeek',    sub:'DeepSeek-V3 · Math & Reasoning',        color:'#00b4d8' },
   // ── Tier 2: High-Performance Brains ───────────────────────────────
-  { key:'mistral',     name:'Mistral',     sub:'mistral-small · Premium Open-Source',   color:'#f97316' },
-  { key:'nvidia',      name:'NVIDIA',      sub:'NIM · Llama 3.1 8B Enterprise',         color:'#76b900' },
-  { key:'zai',         name:'Zai AI',      sub:'GLM-4-Flash · Advanced Multilingual',   color:'#e91e8c' },
+  { key:'mistral',     name:'Mistral',     sub:'mistral-small · Text + Vision',         color:'#f97316' },
+  { key:'nvidia',      name:'NVIDIA',      sub:'NIM · Llama 3.1 70B Enterprise',        color:'#76b900' },
+  { key:'zai',         name:'Zai AI',      sub:'GLM-4.5-Flash · Advanced Multilingual', color:'#e91e8c' },
   // ── Tier 3: Global Cloud & Model Hubs ─────────────────────────────
-  { key:'cloudflare',  name:'Cloudflare',  sub:'Workers AI · Edge Compute',             color:'#f6821f' },
+  { key:'cloudflare',  name:'Cloudflare',  sub:'Workers AI · Llama 3.3 70B Fast',       color:'#f6821f' },
   { key:'siliconflow', name:'SiliconFlow', sub:'Qwen2.5-7B · Open-Source Hub',          color:'#06b6d4' },
   { key:'huggingface', name:'HuggingFace', sub:'Llama 3.1 8B Instruct',                 color:'#ffcc4d' },
   { key:'fireworks',   name:'Fireworks',   sub:'Llama 3.1 8B · Developer Hub',          color:'#ff5e5e' },
   { key:'cohere',      name:'Cohere',      sub:'command-r-08-2024 · Enterprise Text',   color:'#39594D' },
   // ── Tier 4: Ultra-Fast Real-Time Engines ──────────────────────────
   { key:'groq',        name:'Groq',        sub:'gpt-oss-20b · Ultra-Fast Inference',    color:'#FF8C00' },
-  { key:'sambanova',   name:'SambaNova',   sub:'Llama 3.1 8B · Fast Inference',         color:'#cc2936' },
-  { key:'cerebras',    name:'Cerebras',    sub:'Llama 3.1 8B · Fast Inference',         color:'#9b59b6' },
+  { key:'sambanova',   name:'SambaNova',   sub:'Llama 3.3 70B · Fast Inference',        color:'#cc2936' },
+  { key:'cerebras',    name:'Cerebras',    sub:'Llama 3.3 70B · Fast Inference',        color:'#9b59b6' },
 ];
 
 /* Tier groups — used by renderEngineMenu() to draw

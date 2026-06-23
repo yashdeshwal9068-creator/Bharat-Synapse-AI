@@ -22,18 +22,36 @@
  * ENV VARS (Vercel → Project → Settings → Environment Variables):
  *   GEMINI_API_KEY, GEMINI_API_KEY_2        ← Gemini primary + backup
  *   OPENROUTER_API_KEY
- *   DEEPSEEK_API_KEY
+ *   DEEPSEEK_API_KEY                        ← from platform.deepseek.com (needs a topped-up balance)
  *   MISTRAL_API_KEY
- *   NVIDIA_API_KEY
- *   ZAI_API_KEY                             ← Zhipu AI / GLM-4-Flash
- *   CLOUDFLARE_API_KEY, CLOUDFLARE_ACCOUNT_ID
- *   SILICONFLOW_API_KEY
+ *   NVIDIA_API_KEY                          ← starts with "nvapi-", from build.nvidia.com
+ *   ZAI_API_KEY                             ← Z.ai INTERNATIONAL key from z.ai/model-api
+ *                                              (if your key was issued on open.bigmodel.cn
+ *                                              instead, see the comment on the `zai` provider below)
+ *   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID   ← CLOUDFLARE_API_KEY also accepted (legacy alias)
+ *   SILICONFLOW_API_KEY                     ← INTERNATIONAL key from cloud.siliconflow.com
+ *                                              (if your key was issued on cloud.siliconflow.cn
+ *                                              instead, see the comment on the `siliconflow` provider below)
  *   HUGGINGFACE_API_KEY
- *   FIREWORKS_API_KEY
+ *   FIREWORKS_API_KEY                       ← from fireworks.ai (needs a payment method on file
+ *                                              once the $1 trial credit runs out — see provider note)
  *   COHERE_API_KEY
  *   GROQ_API_KEY
  *   SAMBANOVA_API_KEY
  *   CEREBRAS_API_KEY
+ *
+ * ───────────────────────────────────────────────────────
+ * FIX 2 — SMART IMAGE/VISION FAILOVER (no more hard default to Gemini):
+ *   The currently-selected engine is ALWAYS tried first, even for image
+ *   queries. Only Gemini and Mistral (mistral-small-latest supports the
+ *   standard `image_url` multimodal format) can genuinely see an image.
+ *   Every other engine's call() throws a clear "text-only" error the
+ *   instant an image attachment is present — no wasted request to a
+ *   model that can't use it. That throw is caught by the engine loop
+ *   below, which automatically transfers to the next provider in
+ *   FALLBACK_ORDER. Gemini always sits first in FALLBACK_ORDER, so it
+ *   naturally becomes the very next attempt — i.e. Gemini is only ever
+ *   a *backup* for vision now, never the forced default.
  */
 
 export const config = { runtime: 'edge' };
@@ -86,17 +104,56 @@ function appendAttachmentNote(messages, attachment, label) {
   return flat;
 }
 
+/* FIX 2 helper: true only when the attachment is an actual image
+   (vs. a generic file like a PDF/doc), based on its MIME type. */
+function isImageAttachment(attachment) {
+  return !!(attachment && attachment.mimeType && /^image\//i.test(attachment.mimeType));
+}
+
+/* FIX 2 helper: for engines that genuinely support image input (Gemini,
+   Mistral), build the standard OpenAI-style multimodal content array —
+   the most recent user turn becomes [{type:'text'}, {type:'image_url'}]
+   instead of a plain string, so the model actually sees the photo. */
+function buildVisionMessages(messages, attachment) {
+  const flat = flattenMessages(messages);
+  if (!flat.length) return flat;
+  const cleanData = String(attachment.data).replace(/^data:[^;]+;base64,/, '');
+  const dataUrl = `data:${attachment.mimeType};base64,${cleanData}`;
+  const last = flat[flat.length - 1];
+  const content = [];
+  if (last.content && last.content.trim()) content.push({ type: 'text', text: last.content });
+  content.push({ type: 'image_url', image_url: { url: dataUrl } });
+  return [...flat.slice(0, -1), { role: last.role, content }];
+}
+
 /* ════════════════════════════════════════════════════
    GENERIC OpenAI-COMPATIBLE CALLER
    Covers Groq, OpenRouter, Fireworks, NVIDIA NIM, and
    HuggingFace's router — they all speak the same
    /chat/completions shape.
 ════════════════════════════════════════════════════ */
-async function callOpenAICompatible({ url, apiKey, model, messages, temperature, max_tokens, extraHeaders, label, timeoutMs, attachment }) {
+async function callOpenAICompatible({ url, apiKey, model, messages, temperature, max_tokens, extraHeaders, label, timeoutMs, attachment, supportsVision }) {
   if (!apiKey) {
     throw new Error(`${label}: API key not set on the server (check Vercel env vars).`);
   }
-  const outgoingMessages = attachment ? appendAttachmentNote(messages, attachment, label) : flattenMessages(messages);
+
+  // FIX 2: an image attachment gets real multimodal treatment ONLY if this
+  // engine actually supports it (supportsVision === true, e.g. Mistral).
+  // Otherwise we fail fast with a clear error instead of silently
+  // answering blind — that failure is what lets the engine loop in the
+  // main handler automatically transfer to Gemini next.
+  let outgoingMessages;
+  if (attachment && isImageAttachment(attachment)) {
+    if (!supportsVision) {
+      throw new Error(`${label}: this engine is text-only and cannot process image input.`);
+    }
+    outgoingMessages = buildVisionMessages(messages, attachment);
+  } else if (attachment) {
+    outgoingMessages = appendAttachmentNote(messages, attachment, label);
+  } else {
+    outgoingMessages = flattenMessages(messages);
+  }
+
   let res;
   try {
     res = await fetchWithTimeout(url, {
@@ -249,6 +306,13 @@ async function callCohere(messages, temperature, max_tokens, timeoutMs, attachme
   const apiKey = process.env.COHERE_API_KEY;
   if (!apiKey) throw new Error('Cohere: API key not set on the server.');
 
+  // FIX 2: Cohere's v2 chat API doesn't take image input here — fail fast
+  // on photos so the engine loop transfers to Gemini instead of pretending
+  // to answer a question about a picture it never saw.
+  if (attachment && isImageAttachment(attachment)) {
+    throw new Error('Cohere: this engine is text-only and cannot process image input.');
+  }
+
   const outgoingMessages = attachment ? appendAttachmentNote(messages, attachment, 'Cohere') : flattenMessages(messages);
   let res;
   try {
@@ -289,43 +353,47 @@ async function callCohere(messages, temperature, max_tokens, timeoutMs, attachme
    DEEPSEEK — OpenAI-compatible chat API
 ════════════════════════════════════════════════════ */
 /* Uses the standard /v1/chat/completions endpoint.
-   DeepSeek-V3 is state-of-the-art for math and coding. */
+   deepseek-chat is state-of-the-art for math and coding
+   (legacy alias for deepseek-v4-flash until 2026-07-24). */
 
 /* ════════════════════════════════════════════════════
    MISTRAL — OpenAI-compatible chat API
 ════════════════════════════════════════════════════ */
-/* mistral-small-latest is free-tier-safe and strong
-   for multilingual and reasoning tasks. */
+/* mistral-small-latest is free-tier-safe, strong for
+   multilingual/reasoning tasks, AND vision-capable —
+   it accepts image_url content blocks natively. */
 
 /* ════════════════════════════════════════════════════
-   ZAI AI (Zhipu GLM) — OpenAI-compatible chat API
+   ZAI AI (Z.ai / Zhipu GLM) — OpenAI-compatible chat API
 ════════════════════════════════════════════════════ */
-/* GLM-4-Flash is Zhipu AI's free, fast, multilingual
-   model. Endpoint: open.bigmodel.cn */
+/* glm-4.5-flash is Z.ai's free, fast, multilingual model.
+   International endpoint: api.z.ai (separate key/account
+   from the mainland-China open.bigmodel.cn platform). */
 
 /* ════════════════════════════════════════════════════
    CLOUDFLARE WORKERS AI — OpenAI-compatible endpoint
 ════════════════════════════════════════════════════ */
-/* Requires CLOUDFLARE_API_KEY (Bearer token) and
-   CLOUDFLARE_ACCOUNT_ID (from Cloudflare dashboard). */
+/* Requires CLOUDFLARE_API_TOKEN (or legacy CLOUDFLARE_API_KEY)
+   as a Bearer token, plus CLOUDFLARE_ACCOUNT_ID. */
 
 /* ════════════════════════════════════════════════════
    SILICONFLOW — OpenAI-compatible chat API
 ════════════════════════════════════════════════════ */
 /* Qwen2.5-7B-Instruct is free-tier on SiliconFlow.
-   Strong open-source model for general tasks. */
+   International endpoint: api.siliconflow.com (separate
+   key/account from the mainland-China .cn platform). */
 
 /* ════════════════════════════════════════════════════
    SAMBANOVA — OpenAI-compatible chat API
 ════════════════════════════════════════════════════ */
 /* SambaNova's RDU hardware delivers very fast
-   Llama 3.1 inference on their free-tier. */
+   Llama 3.3 70B inference on their free-tier. */
 
 /* ════════════════════════════════════════════════════
    CEREBRAS — OpenAI-compatible chat API
 ════════════════════════════════════════════════════ */
-/* Cerebras chip delivers extremely fast inference.
-   llama3.1-8b is available on their free tier. */
+/* Cerebras's wafer-scale chip delivers extremely fast
+   inference. llama-3.3-70b is the current free-tier model. */
 
 /* ════════════════════════════════════════════════════
    PROVIDER REGISTRY — 14-Engine Super AI
@@ -349,6 +417,12 @@ const PROVIDERS = {
       label: 'OpenRouter',
     }),
   },
+  // FIX 1: DeepSeek's base URL + model were already spec-correct
+  // (api.deepseek.com/v1 + deepseek-chat — the legacy alias is still live
+  // until 2026-07-24, after which switch the model string to
+  // 'deepseek-v4-flash'). If this still fails, the cause is almost always
+  // DEEPSEEK_API_KEY missing in Vercel or an empty/zero account balance —
+  // DeepSeek is pay-as-you-go, not a forever-free tier.
   deepseek: {
     name: 'DeepSeek',
     vision: false,
@@ -361,60 +435,93 @@ const PROVIDERS = {
     }),
   },
   // ── Tier 2: High-Performance Brains ─────────────────────────────
+  // FIX 2: mistral-small-latest natively accepts the standard
+  // `image_url` multimodal content block (Mistral's dedicated Pixtral-12B
+  // model was deprecated in favor of folding vision straight into the
+  // mainline Small/Medium models) — so Mistral is a genuine second
+  // vision-capable engine, not just a text fallback.
   mistral: {
     name: 'Mistral',
-    vision: false,
+    vision: true,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => callOpenAICompatible({
       url: 'https://api.mistral.ai/v1/chat/completions',
       apiKey: process.env.MISTRAL_API_KEY,
       model: 'mistral-small-latest',
       messages, temperature, max_tokens, timeoutMs, attachment,
+      supportsVision: true,
       label: 'Mistral',
     }),
   },
+  // FIX 1: NVIDIA NIM's free-tier catalog rotates monthly; the 70B Llama
+  // 3.1 endpoint is the one consistently documented as live in 2026,
+  // while several smaller models have been cycled out of the catalog.
   nvidia: {
     name: 'NVIDIA',
     vision: false,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => callOpenAICompatible({
       url: 'https://integrate.api.nvidia.com/v1/chat/completions',
       apiKey: process.env.NVIDIA_API_KEY,
-      model: 'meta/llama-3.1-8b-instruct',
+      model: 'meta/llama-3.1-70b-instruct',
       messages, temperature, max_tokens, timeoutMs, attachment,
       label: 'NVIDIA',
     }),
   },
+  // FIX 1: Zhipu/Z.ai runs two completely separate platforms with
+  // separate keys — open.bigmodel.cn (mainland China, needs a Chinese
+  // real-name ID) and api.z.ai (international, Google/GitHub signup).
+  // A key generated on z.ai will always 401 against bigmodel.cn and
+  // vice versa. Switched to the international endpoint + its current
+  // free-tier model. If your key was actually issued on
+  // open.bigmodel.cn, change BOTH the url back to
+  // 'https://open.bigmodel.cn/api/paas/v4/chat/completions' and keep
+  // this same model id (glm-4.5-flash is free on both platforms).
   zai: {
     name: 'Zai AI',
     vision: false,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => callOpenAICompatible({
-      url: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      url: 'https://api.z.ai/api/paas/v4/chat/completions',
       apiKey: process.env.ZAI_API_KEY,
-      model: 'glm-4-flash',
+      model: 'glm-4.5-flash',
       messages, temperature, max_tokens, timeoutMs, attachment,
       label: 'Zai AI',
     }),
   },
   // ── Tier 3: Global Cloud & Model Hubs ───────────────────────────
+  // FIX 1: @cf/meta/llama-3.1-8b-instruct is now marked Deprecated in
+  // Cloudflare's own model catalog — swapped for the current
+  // llama-3.3-70b fp8/fast model. The OpenAI-compatible URL shape
+  // itself (.../ai/v1/chat/completions) was already correct. Also
+  // accepts CLOUDFLARE_API_TOKEN (Cloudflare's own preferred name) as
+  // well as the legacy CLOUDFLARE_API_KEY var already in your project.
   cloudflare: {
     name: 'Cloudflare',
     vision: false,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => {
       const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
       if (!accountId) throw new Error('Cloudflare: CLOUDFLARE_ACCOUNT_ID env var not set.');
+      const apiKey = process.env.CLOUDFLARE_API_TOKEN || process.env.CLOUDFLARE_API_KEY;
       return callOpenAICompatible({
         url: `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`,
-        apiKey: process.env.CLOUDFLARE_API_KEY,
-        model: '@cf/meta/llama-3.1-8b-instruct',
+        apiKey,
+        model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
         messages, temperature, max_tokens, timeoutMs, attachment,
         label: 'Cloudflare',
       });
     },
   },
+  // FIX 1: SiliconFlow also runs two separate platforms — cloud.siliconflow.cn
+  // (mainland China, requires real-name verification) and
+  // cloud.siliconflow.com (international, Google/GitHub signup). A key
+  // from the international site will 401 against the .cn endpoint.
+  // Switched to the international base URL; the model itself
+  // (Qwen2.5-7B-Instruct) was already correct and is still active. If
+  // your key was issued on cloud.siliconflow.cn instead, change the url
+  // back to 'https://api.siliconflow.cn/v1/chat/completions'.
   siliconflow: {
     name: 'SiliconFlow',
     vision: false,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => callOpenAICompatible({
-      url: 'https://api.siliconflow.cn/v1/chat/completions',
+      url: 'https://api.siliconflow.com/v1/chat/completions',
       apiKey: process.env.SILICONFLOW_API_KEY,
       model: 'Qwen/Qwen2.5-7B-Instruct',
       messages, temperature, max_tokens, timeoutMs, attachment,
@@ -432,6 +539,12 @@ const PROVIDERS = {
       label: 'HuggingFace',
     }),
   },
+  // FIX 1: Fireworks' base URL + model id were already spec-correct and
+  // match their current docs exactly. Added the "accept" header from
+  // their official curl example for good measure. If this still fails,
+  // it's almost always because Fireworks is postpaid-after-trial — the
+  // $1 signup credit runs out and a payment method must be added on
+  // fireworks.ai before requests succeed again.
   fireworks: {
     name: 'Fireworks',
     vision: false,
@@ -440,6 +553,7 @@ const PROVIDERS = {
       apiKey: process.env.FIREWORKS_API_KEY,
       model: 'accounts/fireworks/models/llama-v3p1-8b-instruct',
       messages, temperature, max_tokens, timeoutMs, attachment,
+      extraHeaders: { accept: 'application/json' },
       label: 'Fireworks',
     }),
   },
@@ -460,24 +574,29 @@ const PROVIDERS = {
       label: 'Groq',
     }),
   },
+  // FIX 1: Meta-Llama-3.1-8B-Instruct is being phased out of SambaNova's
+  // free tier — Meta-Llama-3.3-70B-Instruct is their current
+  // most-battle-tested free-tier model.
   sambanova: {
     name: 'SambaNova',
     vision: false,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => callOpenAICompatible({
       url: 'https://api.sambanova.ai/v1/chat/completions',
       apiKey: process.env.SAMBANOVA_API_KEY,
-      model: 'Meta-Llama-3.1-8B-Instruct',
+      model: 'Meta-Llama-3.3-70B-Instruct',
       messages, temperature, max_tokens, timeoutMs, attachment,
       label: 'SambaNova',
     }),
   },
+  // FIX 1: llama3.1-8b was deprecated on Cerebras on 2026-05-27 —
+  // llama-3.3-70b is the current supported free-tier model.
   cerebras: {
     name: 'Cerebras',
     vision: false,
     call: (messages, temperature, max_tokens, timeoutMs, attachment) => callOpenAICompatible({
       url: 'https://api.cerebras.ai/v1/chat/completions',
       apiKey: process.env.CEREBRAS_API_KEY,
-      model: 'llama3.1-8b',
+      model: 'llama-3.3-70b',
       messages, temperature, max_tokens, timeoutMs, attachment,
       label: 'Cerebras',
     }),
@@ -549,13 +668,14 @@ export default async function handler(req) {
     };
   }
 
-  // If a file/image is attached but the user's chosen engine can't see
-  // it, automatically lock this request to the vision-capable engine
-  // (Gemini) instead of ignoring the attachment or letting a text-only
-  // provider error out on it.
-  if (attachment && !PROVIDERS[requestedEngine].vision) {
-    requestedEngine = 'gemini';
-  }
+  // FIX 2 — Smart image/vision failover: we deliberately do NOT
+  // force-switch to Gemini here anymore. The user's selected engine is
+  // tried first with the image attached (see PROVIDERS above). If that
+  // engine can't actually see images, its own call() throws a clear
+  // "text-only" error, and the engine loop below automatically transfers
+  // to the next entry in FALLBACK_ORDER — which always places Gemini
+  // immediately next — so Gemini only ever steps in as a backup, never
+  // as the forced default.
 
   // Try the requested engine first, then automatically transfer to the
   // next highest-intelligence provider in FALLBACK_ORDER. Bounded by a
